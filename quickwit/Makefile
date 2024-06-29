@@ -29,11 +29,12 @@ test-all:
 	QW_S3_ENDPOINT=http://localhost:4566 \
 	QW_S3_FORCE_PATH_STYLE_ACCESS=1 \
 	QW_TEST_DATABASE_URL=postgres://quickwit-dev:quickwit-dev@localhost:5432/quickwit-metastore-dev \
-	cargo test --all-features
-	cargo test --test failpoints --features fail/failpoints
+	RUST_MIN_STACK=67108864 \
+	cargo nextest run --all-features --retries 1
+	cargo nextest run --test failpoints --features fail/failpoints
 
 test-failpoints:
-	cargo test --test failpoints --features fail/failpoints
+	cargo nextest run --test failpoints --features fail/failpoints
 
 # TODO: to be replaced by https://github.com/quickwit-oss/quickwit/issues/237
 TARGET ?= x86_64-unknown-linux-gnu

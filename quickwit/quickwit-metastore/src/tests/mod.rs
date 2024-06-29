@@ -175,8 +175,10 @@ macro_rules! metastore_test_suite {
             // Index API tests
             //
             //  - create_index
+            //  - update_index
             //  - index_exists
             //  - index_metadata
+            //  - indexes_metadata
             //  - list_indexes
             //  - delete_index
 
@@ -187,15 +189,27 @@ macro_rules! metastore_test_suite {
             }
 
             #[tokio::test]
-            async fn test_metastore_update_index() {
-                let _ = tracing_subscriber::fmt::try_init();
-                $crate::tests::index::test_metastore_update_index::<$metastore_type>().await;
-            }
-
-            #[tokio::test]
             async fn test_metastore_create_index_with_sources() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_create_index_with_sources::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            async fn test_metastore_update_retention_policy() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::index::test_metastore_update_retention_policy::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            async fn test_metastore_update_search_settings() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::index::test_metastore_update_search_settings::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            async fn test_metastore_update_indexing_settings() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::index::test_metastore_update_indexing_settings::<$metastore_type>().await;
             }
 
             #[tokio::test]
@@ -217,6 +231,12 @@ macro_rules! metastore_test_suite {
             async fn test_metastore_index_metadata() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::index::test_metastore_index_metadata::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            async fn test_metastore_indexes_metadata() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::index::test_metastore_indexes_metadata::<$metastore_type>().await;
             }
 
             #[tokio::test]
@@ -302,6 +322,12 @@ macro_rules! metastore_test_suite {
             async fn test_metastore_list_splits() {
                 let _ = tracing_subscriber::fmt::try_init();
                 $crate::tests::list_splits::test_metastore_list_splits::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            async fn test_metastore_list_splits_by_node() {
+                let _ = tracing_subscriber::fmt::try_init();
+                $crate::tests::list_splits::test_metastore_list_splits_by_node_id::<$metastore_type>().await;
             }
 
             #[tokio::test]

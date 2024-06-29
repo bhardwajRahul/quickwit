@@ -29,8 +29,10 @@ use quickwit_proto::search::{
 };
 use quickwit_storage::Storage;
 use tantivy::query::Query;
-use tantivy::schema::{Document as DocumentTrait, Field, OwnedValue, TantivyDocument, Value};
-use tantivy::{ReloadPolicy, Score, Searcher, SnippetGenerator, Term};
+use tantivy::schema::document::CompactDocValue;
+use tantivy::schema::{Document as DocumentTrait, Field, TantivyDocument, Value};
+use tantivy::snippet::SnippetGenerator;
+use tantivy::{ReloadPolicy, Score, Searcher, Term};
 use tracing::{error, Instrument};
 
 use crate::leaf::open_index_with_caches;
@@ -60,7 +62,7 @@ async fn fetch_docs_to_map(
     global_doc_addrs.sort_by(|a, b| a.split.cmp(&b.split));
     for (split_id, global_doc_addrs) in global_doc_addrs
         .iter()
-        .group_by(|global_doc_addr| global_doc_addr.split.as_str())
+        .chunk_by(|global_doc_addr| global_doc_addr.split.as_str())
         .into_iter()
     {
         let global_doc_addrs: Vec<GlobalDocAddress> =
@@ -172,7 +174,7 @@ async fn fetch_docs_in_split(
     global_doc_addrs.sort_by_key(|doc| doc.doc_addr);
     // Opens the index without the ephemeral unbounded cache, this cache is indeed not useful
     // when fetching docs as we will fetch them only once.
-    let index = open_index_with_caches(
+    let mut index = open_index_with_caches(
         &searcher_context,
         index_storage,
         split,
@@ -181,6 +183,12 @@ async fn fetch_docs_in_split(
     )
     .await
     .context("open-index-for-split")?;
+    // we add an executor here, we could add it in open_index_with_caches, though we should verify
+    // the side-effect before
+    let tantivy_executor = crate::search_thread_pool()
+        .get_underlying_rayon_thread_pool()
+        .into();
+    index.set_executor(tantivy_executor);
     let index_reader = index
         .reader_builder()
         // the docs are presorted so a cache size of NUM_CONCURRENT_REQUESTS is fine
@@ -267,7 +275,7 @@ impl FieldsSnippetGenerator {
     fn snippets_from_field_values(
         &self,
         field_name: &str,
-        field_values: Vec<&OwnedValue>,
+        field_values: Vec<CompactDocValue<'_>>,
     ) -> Option<Vec<String>> {
         if let Some(snippet_generator) = self.field_generators.get(field_name) {
             let values = field_values

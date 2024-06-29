@@ -33,8 +33,8 @@ Metastore database backups are disabled as restoring one would lead to
 inconsistencies with the index store on S3. To ensure high availability, you
 should enable `rds_config.multi_az` instead. To use your own Postgres database
 instead of creating a new RDS instance, configure the
-`external_postgres_uri_ssm_parameter_arn` variable (e.g
-`postgres://user:password@domain:port/db`).
+`external_postgres_uri_secret_arn` variable (e.g ARN of an SSM parameter with
+the value `postgres://user:password@domain:port/db`).
 
 Using NAT Gateways for the image registry is quite costly (approx. $0.05/hour/AZ). If
 you are not already using NAT Gateways in the AZs where Quickwit will be
@@ -64,14 +64,16 @@ IAM policies to indexers.
 We provide an example of self contained deployment with an ad-hoc VPC. 
 
 > [!IMPORTANT]
-> This stack costs ~$150/month to run (Fargate tasks, NAT Gateways
+> This stack costs ~$200/month to run (Fargate tasks, NAT Gateways
 > and RDS)
 
-To make it easy to access your the Quickwit cluster, this stack includes a
-bastion instance. Access is secured using an SSH key pair that you need to
+### Deploy the Quickwit module and connect through a bastion
+
+To make it easy to access your Quickwit cluster, the example stack includes
+a bastion instance. Access is secured using an SSH key pair that you need to
 provide (e.g generated with `ssh-keygen -t ed25519`).
 
-In the `./example` directory create a `terraform.tfvars` file with the public
+In the `./example` directory, create a `terraform.tfvars` file with the public
 key of your RSA key pair:
 
 ```terraform
@@ -119,3 +121,18 @@ curl -X POST \
 
 If your SSH tunnel to the searcher is still running, you should be able to see
 the ingested data in the UI.
+
+### Setup an ECR repository to avoid throttling from Docker Hub
+
+By default, the example stack uses Docker Hub to pull the Quickwit image. This
+is convenient but it quickly runs into rate limiting. To avoid this, in the
+`terraform.tfvars` file, set the `dockerhub_pull_through_creds_secret_arn` to a
+AWS Secret with the following content:
+
+```json
+{"username":"...","accessToken":"..."}
+```
+
+This will:
+- provision an ECR repository and a pull through cache rule
+- configure the Quickwit module to use that repository

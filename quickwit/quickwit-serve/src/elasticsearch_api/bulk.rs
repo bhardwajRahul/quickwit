@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use hyper::StatusCode;
-use quickwit_config::enable_ingest_v2;
+use quickwit_config::{disable_ingest_v1, enable_ingest_v2};
 use quickwit_ingest::{
     CommitType, DocBatchBuilder, IngestRequest, IngestService, IngestServiceClient,
 };
@@ -35,6 +35,7 @@ use crate::elasticsearch_api::make_elastic_api_response;
 use crate::elasticsearch_api::model::{BulkAction, ElasticBulkOptions, ElasticsearchError};
 use crate::format::extract_format_from_qs;
 use crate::ingest_api::lines;
+use crate::rest::recover_fn;
 use crate::{with_arg, Body};
 
 /// POST `_elastic/_bulk`
@@ -50,6 +51,7 @@ pub fn es_compat_bulk_handler(
         })
         .and(extract_format_from_qs())
         .map(make_elastic_api_response)
+        .recover(recover_fn)
 }
 
 /// POST `_elastic/<index>/_bulk`
@@ -73,17 +75,25 @@ pub fn es_compat_index_bulk_handler(
         )
         .and(extract_format_from_qs())
         .map(make_elastic_api_response)
+        .recover(recover_fn)
 }
 
 async fn elastic_ingest_bulk(
     default_index_id: Option<IndexId>,
     body: Body,
     bulk_options: ElasticBulkOptions,
-    mut ingest_service: IngestServiceClient,
+    ingest_service: IngestServiceClient,
     ingest_router: IngestRouterServiceClient,
 ) -> Result<ElasticBulkResponse, ElasticsearchError> {
     if enable_ingest_v2() || bulk_options.enable_ingest_v2 {
         return elastic_bulk_ingest_v2(default_index_id, body, bulk_options, ingest_router).await;
+    }
+    if disable_ingest_v1() {
+        return Err(ElasticsearchError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ingest v1 is disabled: environment variable `QW_DISABLE_INGEST_V1` is set".to_string(),
+            None,
+        ));
     }
     let now = Instant::now();
     let mut doc_batch_builders = HashMap::new();
@@ -139,7 +149,7 @@ async fn elastic_ingest_bulk(
     let bulk_response = ElasticBulkResponse {
         took_millis,
         errors,
-        items: Vec::new(),
+        actions: Vec::new(),
     };
     Ok(bulk_response)
 }

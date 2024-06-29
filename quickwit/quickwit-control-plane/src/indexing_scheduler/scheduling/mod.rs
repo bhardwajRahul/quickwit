@@ -25,6 +25,7 @@ use std::num::NonZeroU32;
 
 use fnv::{FnvHashMap, FnvHashSet};
 use quickwit_common::rate_limited_debug;
+use quickwit_proto::control_plane::RebuildPlanResponse;
 use quickwit_proto::indexing::{CpuCapacity, IndexingTask};
 use quickwit_proto::types::{PipelineUid, ShardId, SourceUid};
 use scheduling_logic_model::{IndexerOrd, SourceOrd};
@@ -267,7 +268,7 @@ fn convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 IndexingTask {
                     index_uid: Some(source.source_uid.index_uid.clone()),
                     source_id: source.source_uid.source_id.clone(),
-                    pipeline_uid: Some(PipelineUid::new()),
+                    pipeline_uid: Some(PipelineUid::random()),
                     shard_ids: Vec::new(),
                 }
             });
@@ -283,7 +284,7 @@ fn convert_scheduling_solution_to_physical_plan_single_node_single_source(
                 vec![IndexingTask {
                     index_uid: Some(source.source_uid.index_uid.clone()),
                     source_id: source.source_uid.source_id.clone(),
-                    pipeline_uid: Some(PipelineUid::new()),
+                    pipeline_uid: Some(PipelineUid::random()),
                     shard_ids: Vec::new(),
                 }]
             }
@@ -551,7 +552,7 @@ fn add_shard_to_indexer(
         indexer_tasks.push(IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.clone(),
-            pipeline_uid: Some(PipelineUid::new()),
+            pipeline_uid: Some(PipelineUid::random()),
             shard_ids: vec![missing_shard],
         });
     }
@@ -609,6 +610,7 @@ pub fn build_physical_indexing_plan(
     indexer_id_to_cpu_capacities: &FnvHashMap<String, CpuCapacity>,
     previous_plan_opt: Option<&PhysicalIndexingPlan>,
     shard_locations: &ShardLocations,
+    mut debug_output_opt: Option<&mut RebuildPlanResponse>,
 ) -> PhysicalIndexingPlan {
     // Asserts that the source are valid.
     check_sources(sources);
@@ -623,12 +625,22 @@ pub fn build_physical_indexing_plan(
 
     // Populate the previous solution, if any.
     let mut previous_solution = problem.new_solution();
+
     if let Some(previous_plan) = previous_plan_opt {
         convert_physical_plan_to_solution(previous_plan, &id_to_ord_map, &mut previous_solution);
     }
 
+    if let Some(debug_output) = &mut debug_output_opt {
+        debug_output.previous_solution_json = serde_json::to_string(&previous_solution).unwrap();
+        debug_output.problem_json = serde_json::to_string(&problem).unwrap();
+    }
+
     // Compute the new scheduling solution using a heuristic.
     let new_solution = scheduling_logic::solve(problem, previous_solution);
+
+    if let Some(debug_output) = debug_output_opt {
+        debug_output.new_solution_json = serde_json::to_string(&new_solution).unwrap();
+    }
 
     // Convert the new scheduling solution back to a physical plan.
     let new_physical_plan = convert_scheduling_solution_to_physical_plan(
@@ -727,7 +739,7 @@ mod tests {
 
     fn source_id() -> SourceUid {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let index = IndexUid::from_parts("test_index", 0);
+        let index = IndexUid::for_test("test_index", 0);
         let source_id = COUNTER.fetch_add(1, Ordering::SeqCst);
         SourceUid {
             index_uid: index,
@@ -778,6 +790,7 @@ mod tests {
             &indexer_id_to_cpu_capacities,
             None,
             &shard_locations,
+            None,
         );
         assert_eq!(indexing_plan.indexing_tasks_per_indexer().len(), 2);
 
@@ -848,6 +861,7 @@ mod tests {
             &indexer_id_to_cpu_capacities,
             None,
             &shard_locations,
+            None,
         );
         assert_eq!(plan.indexing_tasks_per_indexer().len(), num_indexers);
         let metrics = get_shard_locality_metrics(&plan, &shard_locations);
@@ -876,8 +890,13 @@ mod tests {
         {
             indexer_max_loads.insert(indexer1.clone(), mcpu(1_999));
             // This test what happens when there isn't enough capacity on the cluster.
-            let physical_plan =
-                build_physical_indexing_plan(&sources, &indexer_max_loads, None, &shard_locations);
+            let physical_plan = build_physical_indexing_plan(
+                &sources,
+                &indexer_max_loads,
+                None,
+                &shard_locations,
+                None,
+            );
             assert_eq!(physical_plan.indexing_tasks_per_indexer().len(), 1);
             let expected_tasks = physical_plan.indexer(&indexer1).unwrap();
             assert_eq!(expected_tasks.len(), 2);
@@ -886,8 +905,13 @@ mod tests {
         {
             indexer_max_loads.insert(indexer1.clone(), mcpu(2_000));
             // This test what happens when there isn't enough capacity on the cluster.
-            let physical_plan =
-                build_physical_indexing_plan(&sources, &indexer_max_loads, None, &shard_locations);
+            let physical_plan = build_physical_indexing_plan(
+                &sources,
+                &indexer_max_loads,
+                None,
+                &shard_locations,
+                None,
+            );
             assert_eq!(physical_plan.indexing_tasks_per_indexer().len(), 1);
             let expected_tasks = physical_plan.indexer(&indexer1).unwrap();
             assert_eq!(expected_tasks.len(), 2);
@@ -955,6 +979,7 @@ mod tests {
             &indexer_id_to_cpu_capacities,
             Some(&indexing_plan),
             &shard_locations,
+            None,
         );
         let indexing_tasks = new_plan.indexer("node1").unwrap();
         assert_eq!(indexing_tasks.len(), 2);
@@ -995,6 +1020,7 @@ mod tests {
             &indexer_id_to_cpu_capacities,
             Some(&indexing_plan),
             &shard_locations,
+            None,
         );
         let mut indexing_tasks = new_plan.indexer(NODE).unwrap().to_vec();
         for indexing_task in &mut indexing_tasks {
@@ -1177,7 +1203,13 @@ mod tests {
         let mut capacities = FnvHashMap::default();
         capacities.insert("indexer-1".to_string(), CpuCapacity::from_cpu_millis(8000));
         let shard_locations = ShardLocations::default();
-        build_physical_indexing_plan(&sources_to_schedule, &capacities, None, &shard_locations);
+        build_physical_indexing_plan(
+            &sources_to_schedule,
+            &capacities,
+            None,
+            &shard_locations,
+            None,
+        );
     }
 
     #[test]
@@ -1189,13 +1221,13 @@ mod tests {
         let previous_task1 = IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.to_string(),
-            pipeline_uid: Some(PipelineUid::new()),
+            pipeline_uid: Some(PipelineUid::random()),
             shard_ids: vec![ShardId::from(1), ShardId::from(4), ShardId::from(5)],
         };
         let previous_task2 = IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.to_string(),
-            pipeline_uid: Some(PipelineUid::new()),
+            pipeline_uid: Some(PipelineUid::random()),
             shard_ids: vec![
                 ShardId::from(6),
                 ShardId::from(7),
@@ -1259,14 +1291,14 @@ mod tests {
             index_uid: IndexUid::new_with_random_ulid("testindex"),
             source_id: "testsource".to_string(),
         };
-        let pipeline_uid1 = PipelineUid::new();
+        let pipeline_uid1 = PipelineUid::random();
         let previous_task1 = IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.to_string(),
             pipeline_uid: Some(pipeline_uid1),
             shard_ids: Vec::new(),
         };
-        let pipeline_uid2 = PipelineUid::new();
+        let pipeline_uid2 = PipelineUid::random();
         let previous_task2 = IndexingTask {
             index_uid: Some(source_uid.index_uid.clone()),
             source_id: source_uid.source_id.to_string(),

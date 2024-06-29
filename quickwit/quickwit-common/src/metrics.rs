@@ -21,11 +21,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, HistogramOpts, Opts, TextEncoder};
 pub use prometheus::{
-    Histogram, HistogramTimer, HistogramVec as PrometheusHistogramVec, IntCounter,
-    IntCounterVec as PrometheusIntCounterVec, IntGauge, IntGaugeVec as PrometheusIntGaugeVec,
+    exponential_buckets, Histogram, HistogramTimer, HistogramVec as PrometheusHistogramVec,
+    IntCounter, IntCounterVec as PrometheusIntCounterVec, IntGauge,
+    IntGaugeVec as PrometheusIntGaugeVec,
 };
+use prometheus::{Gauge, HistogramOpts, Opts, TextEncoder};
 
 #[derive(Clone)]
 pub struct HistogramVec<const N: usize> {
@@ -70,10 +71,39 @@ pub fn register_info(name: &'static str, help: &'static str, kvs: BTreeMap<&'sta
     prometheus::register(Box::new(counter)).expect("failed to register counter");
 }
 
-pub fn new_counter(name: &str, help: &str, subsystem: &str) -> IntCounter {
+pub fn new_counter(
+    name: &str,
+    help: &str,
+    subsystem: &str,
+    const_labels: &[(&str, &str)],
+) -> IntCounter {
+    let owned_const_labels: HashMap<String, String> = const_labels
+        .iter()
+        .map(|(label_name, label_value)| (label_name.to_string(), label_value.to_string()))
+        .collect();
     let counter_opts = Opts::new(name, help)
         .namespace("quickwit")
-        .subsystem(subsystem);
+        .subsystem(subsystem)
+        .const_labels(owned_const_labels);
+    let counter = IntCounter::with_opts(counter_opts).expect("failed to create counter");
+    prometheus::register(Box::new(counter.clone())).expect("failed to register counter");
+    counter
+}
+
+pub fn new_counter_with_labels(
+    name: &str,
+    help: &str,
+    subsystem: &str,
+    const_labels: &[(&str, &str)],
+) -> IntCounter {
+    let owned_const_labels: HashMap<String, String> = const_labels
+        .iter()
+        .map(|(label_name, label_value)| (label_name.to_string(), label_value.to_string()))
+        .collect();
+    let counter_opts = Opts::new(name, help)
+        .namespace("quickwit")
+        .subsystem(subsystem)
+        .const_labels(owned_const_labels);
     let counter = IntCounter::with_opts(counter_opts).expect("failed to create counter");
     prometheus::register(Box::new(counter.clone())).expect("failed to register counter");
     counter
@@ -101,6 +131,25 @@ pub fn new_counter_vec<const N: usize>(
     prometheus::register(collector).expect("failed to register counter vec");
 
     IntCounterVec { underlying }
+}
+
+pub fn new_float_gauge(
+    name: &str,
+    help: &str,
+    subsystem: &str,
+    const_labels: &[(&str, &str)],
+) -> Gauge {
+    let owned_const_labels: HashMap<String, String> = const_labels
+        .iter()
+        .map(|(label_name, label_value)| (label_name.to_string(), label_value.to_string()))
+        .collect();
+    let gauge_opts = Opts::new(name, help)
+        .namespace("quickwit")
+        .subsystem(subsystem)
+        .const_labels(owned_const_labels);
+    let gauge = Gauge::with_opts(gauge_opts).expect("failed to create float gauge");
+    prometheus::register(Box::new(gauge.clone())).expect("failed to register float gauge");
+    gauge
 }
 
 pub fn new_gauge(
@@ -146,10 +195,11 @@ pub fn new_gauge_vec<const N: usize>(
     IntGaugeVec { underlying }
 }
 
-pub fn new_histogram(name: &str, help: &str, subsystem: &str) -> Histogram {
+pub fn new_histogram(name: &str, help: &str, subsystem: &str, buckets: Vec<f64>) -> Histogram {
     let histogram_opts = HistogramOpts::new(name, help)
         .namespace("quickwit")
-        .subsystem(subsystem);
+        .subsystem(subsystem)
+        .buckets(buckets);
     let histogram = Histogram::with_opts(histogram_opts).expect("failed to create histogram");
     prometheus::register(Box::new(histogram.clone())).expect("failed to register histogram");
     histogram
@@ -161,6 +211,7 @@ pub fn new_histogram_vec<const N: usize>(
     subsystem: &str,
     const_labels: &[(&str, &str)],
     label_names: [&str; N],
+    buckets: Vec<f64>,
 ) -> HistogramVec<N> {
     let owned_const_labels: HashMap<String, String> = const_labels
         .iter()
@@ -169,7 +220,8 @@ pub fn new_histogram_vec<const N: usize>(
     let histogram_opts = HistogramOpts::new(name, help)
         .namespace("quickwit")
         .subsystem(subsystem)
-        .const_labels(owned_const_labels);
+        .const_labels(owned_const_labels)
+        .buckets(buckets);
     let underlying = PrometheusHistogramVec::new(histogram_opts, &label_names)
         .expect("failed to create histogram vec");
 
@@ -179,19 +231,19 @@ pub fn new_histogram_vec<const N: usize>(
     HistogramVec { underlying }
 }
 
-pub struct GaugeGuard {
-    gauge: &'static IntGauge,
+pub struct GaugeGuard<'a> {
+    gauge: &'a IntGauge,
     delta: i64,
 }
 
-impl std::fmt::Debug for GaugeGuard {
+impl<'a> std::fmt::Debug for GaugeGuard<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.delta.fmt(f)
     }
 }
 
-impl GaugeGuard {
-    pub fn from_gauge(gauge: &'static IntGauge) -> Self {
+impl<'a> GaugeGuard<'a> {
+    pub fn from_gauge(gauge: &'a IntGauge) -> Self {
         Self { gauge, delta: 0i64 }
     }
 
@@ -210,18 +262,59 @@ impl GaugeGuard {
     }
 }
 
-impl Drop for GaugeGuard {
+impl<'a> Drop for GaugeGuard<'a> {
     fn drop(&mut self) {
         self.gauge.sub(self.delta)
     }
 }
 
-pub fn metrics_text_payload() -> String {
+pub struct OwnedGaugeGuard {
+    gauge: IntGauge,
+    delta: i64,
+}
+
+impl std::fmt::Debug for OwnedGaugeGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.delta.fmt(f)
+    }
+}
+
+impl OwnedGaugeGuard {
+    pub fn from_gauge(gauge: IntGauge) -> Self {
+        Self { gauge, delta: 0i64 }
+    }
+
+    pub fn get(&self) -> i64 {
+        self.delta
+    }
+
+    pub fn add(&mut self, delta: i64) {
+        self.gauge.add(delta);
+        self.delta += delta;
+    }
+
+    pub fn sub(&mut self, delta: i64) {
+        self.gauge.sub(delta);
+        self.delta -= delta;
+    }
+}
+
+impl Drop for OwnedGaugeGuard {
+    fn drop(&mut self) {
+        self.gauge.sub(self.delta)
+    }
+}
+
+pub fn metrics_text_payload() -> Result<String, String> {
     let metric_families = prometheus::gather();
-    let mut buffer = Vec::new();
+    // Arbitrary non-zero size in order to skip a bunch of
+    // buffer growth-reallocations when encoding metrics.
+    let mut buffer = String::with_capacity(1024);
     let encoder = TextEncoder::new();
-    let _ = encoder.encode(&metric_families, &mut buffer); // TODO avoid ignoring the error.
-    String::from_utf8_lossy(&buffer).to_string()
+    match encoder.encode_utf8(&metric_families, &mut buffer) {
+        Ok(()) => Ok(buffer),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[derive(Clone)]
@@ -357,6 +450,18 @@ impl InFlightDataGauges {
             self.in_flight_gauge_vec
                 .with_label_values(["pulsar_source"])
         })
+    }
+}
+
+/// This function returns `index_name` or projects it to `<any>` if per-index metrics are disabled.
+pub fn index_label(index_name: &str) -> &str {
+    static PER_INDEX_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
+    let per_index_metrics_enabled: bool = *PER_INDEX_METRICS_ENABLED
+        .get_or_init(|| !crate::get_bool_from_env("QW_DISABLE_PER_INDEX_METRICS", false));
+    if per_index_metrics_enabled {
+        index_name
+    } else {
+        "__any__"
     }
 }
 

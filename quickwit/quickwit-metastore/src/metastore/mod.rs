@@ -31,15 +31,19 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 pub use index_metadata::IndexMetadata;
 use itertools::Itertools;
-use quickwit_config::{IndexConfig, RetentionPolicy, SearchSettings, SourceConfig};
+use quickwit_common::thread_pool::run_cpu_intensive;
+use quickwit_config::{
+    IndexConfig, IndexingSettings, RetentionPolicy, SearchSettings, SourceConfig,
+};
 use quickwit_doc_mapper::tag_pruning::TagFilterAst;
 use quickwit_proto::metastore::{
     serde_utils, AddSourceRequest, CreateIndexRequest, CreateIndexResponse, DeleteTask,
-    IndexMetadataRequest, IndexMetadataResponse, ListIndexesMetadataResponse, ListSplitsRequest,
-    ListSplitsResponse, MetastoreError, MetastoreResult, MetastoreService, MetastoreServiceClient,
-    MetastoreServiceStream, PublishSplitsRequest, StageSplitsRequest, UpdateIndexRequest,
+    IndexMetadataFailure, IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataResponse,
+    ListIndexesMetadataResponse, ListSplitsRequest, ListSplitsResponse, MetastoreError,
+    MetastoreResult, MetastoreService, MetastoreServiceClient, MetastoreServiceStream,
+    PublishSplitsRequest, StageSplitsRequest, UpdateIndexRequest,
 };
-use quickwit_proto::types::{IndexUid, SplitId};
+use quickwit_proto::types::{IndexUid, NodeId, SplitId};
 use time::OffsetDateTime;
 
 use crate::checkpoint::IndexCheckpointDelta;
@@ -186,6 +190,7 @@ pub trait UpdateIndexRequestExt {
         index_uid: impl Into<IndexUid>,
         search_settings: &SearchSettings,
         retention_policy_opt: &Option<RetentionPolicy>,
+        indexing_settings: &IndexingSettings,
     ) -> MetastoreResult<UpdateIndexRequest>;
 
     /// Deserializes the `search_settings_json` field of an [`UpdateIndexRequest`] into a
@@ -195,6 +200,10 @@ pub trait UpdateIndexRequestExt {
     /// Deserializes the `retention_policy_json` field of an [`UpdateIndexRequest`] into a
     /// [`RetentionPolicy`] object.
     fn deserialize_retention_policy(&self) -> MetastoreResult<Option<RetentionPolicy>>;
+
+    /// Deserializes the `indexing_settings_json` field of an [`UpdateIndexRequest`] into a
+    /// [`IndexingSettings`] object.
+    fn deserialize_indexing_settings(&self) -> MetastoreResult<IndexingSettings>;
 }
 
 impl UpdateIndexRequestExt for UpdateIndexRequest {
@@ -202,17 +211,20 @@ impl UpdateIndexRequestExt for UpdateIndexRequest {
         index_uid: impl Into<IndexUid>,
         search_settings: &SearchSettings,
         retention_policy_opt: &Option<RetentionPolicy>,
+        indexing_settings: &IndexingSettings,
     ) -> MetastoreResult<UpdateIndexRequest> {
-        let search_settings_json = serde_utils::to_json_str(&search_settings)?;
+        let search_settings_json = serde_utils::to_json_str(search_settings)?;
         let retention_policy_json = retention_policy_opt
             .as_ref()
             .map(serde_utils::to_json_str)
             .transpose()?;
+        let indexing_settings_json = serde_utils::to_json_str(indexing_settings)?;
 
         let update_request = UpdateIndexRequest {
             index_uid: Some(index_uid.into()),
             search_settings_json,
             retention_policy_json,
+            indexing_settings_json,
         };
         Ok(update_request)
     }
@@ -226,6 +238,10 @@ impl UpdateIndexRequestExt for UpdateIndexRequest {
             .as_ref()
             .map(|policy| serde_utils::from_json_str(policy))
             .transpose()
+    }
+
+    fn deserialize_indexing_settings(&self) -> MetastoreResult<IndexingSettings> {
+        serde_utils::from_json_str(&self.indexing_settings_json)
     }
 }
 
@@ -255,6 +271,61 @@ impl IndexMetadataResponseExt for IndexMetadataResponse {
     }
 }
 
+/// Helper trait to build a [`IndexesMetadataResponse`] and deserialize its payload.
+#[async_trait]
+pub trait IndexesMetadataResponseExt {
+    /// Creates a new `IndexesMetadataResponse` from a `Vec` of [`IndexMetadata`].
+    async fn try_from_indexes_metadata(
+        indexes_metadata: Vec<IndexMetadata>,
+        failures: Vec<IndexMetadataFailure>,
+    ) -> MetastoreResult<IndexesMetadataResponse>;
+
+    /// Deserializes the payload of an `IndexesMetadataResponse` into a `Vec`` of [`IndexMetadata`].
+    async fn deserialize_indexes_metadata(self) -> MetastoreResult<Vec<IndexMetadata>>;
+
+    /// Creates a new `IndexesMetadataResponse` from a `Vec` of [`IndexMetadata`] synchronously.
+    #[cfg(any(test, feature = "testsuite"))]
+    fn for_test(
+        indexes_metadata: Vec<IndexMetadata>,
+        failures: Vec<IndexMetadataFailure>,
+    ) -> IndexesMetadataResponse {
+        use futures::executor;
+
+        executor::block_on(Self::try_from_indexes_metadata(indexes_metadata, failures)).unwrap()
+    }
+}
+
+#[async_trait]
+impl IndexesMetadataResponseExt for IndexesMetadataResponse {
+    async fn try_from_indexes_metadata(
+        indexes_metadata: Vec<IndexMetadata>,
+        failures: Vec<IndexMetadataFailure>,
+    ) -> MetastoreResult<Self> {
+        let indexes_metadata_json_zstd = run_cpu_intensive(move || {
+            serde_utils::to_json_zstd(&indexes_metadata, 0).map(Bytes::from)
+        })
+        .await
+        .map_err(|join_error| MetastoreError::Internal {
+            message: "failed to serialize indexes metadata".to_string(),
+            cause: join_error.to_string(),
+        })??;
+        let response = Self {
+            indexes_metadata_json_zstd,
+            failures,
+        };
+        Ok(response)
+    }
+
+    async fn deserialize_indexes_metadata(self) -> MetastoreResult<Vec<IndexMetadata>> {
+        run_cpu_intensive(move || serde_utils::from_json_zstd(&self.indexes_metadata_json_zstd))
+            .await
+            .map_err(|join_error| MetastoreError::Internal {
+                message: "failed to deserialize indexes metadata".to_string(),
+                cause: join_error.to_string(),
+            })?
+    }
+}
+
 /// Helper trait to build a `ListIndexesResponse` and deserialize its payload.
 #[async_trait]
 pub trait ListIndexesMetadataResponseExt {
@@ -280,7 +351,7 @@ impl ListIndexesMetadataResponseExt for ListIndexesMetadataResponse {
     async fn try_from_indexes_metadata(
         indexes_metadata: Vec<IndexMetadata>,
     ) -> MetastoreResult<Self> {
-        let indexes_metadata_json_zstd = tokio::task::spawn_blocking(move || {
+        let indexes_metadata_json_zstd = run_cpu_intensive(move || {
             serde_utils::to_json_zstd(&indexes_metadata, 0).map(Bytes::from)
         })
         .await
@@ -296,7 +367,7 @@ impl ListIndexesMetadataResponseExt for ListIndexesMetadataResponse {
     }
 
     async fn deserialize_indexes_metadata(self) -> MetastoreResult<Vec<IndexMetadata>> {
-        tokio::task::spawn_blocking(move || {
+        run_cpu_intensive(move || {
             if let Some(indexes_metadata_json) = &self.indexes_metadata_json_opt {
                 return serde_utils::from_json_str(indexes_metadata_json);
             };
@@ -499,8 +570,11 @@ impl ListSplitsResponseExt for ListSplitsResponse {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 /// A query builder for listing splits within the metastore.
 pub struct ListSplitsQuery {
-    /// A non-empty list of index UIDs to get splits from.
+    /// A non-empty list of index UIDs for which to fetch the splits.
     pub index_uids: Vec<IndexUid>,
+
+    /// A specific node ID to filter by.
+    pub node_id: Option<NodeId>,
 
     /// The maximum number of splits to retrieve.
     pub limit: Option<usize>,
@@ -540,6 +614,7 @@ impl ListSplitsQuery {
     pub fn for_index(index_uid: IndexUid) -> Self {
         Self {
             index_uids: vec![index_uid],
+            node_id: None,
             limit: None,
             offset: None,
             split_states: Vec::new(),
@@ -564,6 +639,7 @@ impl ListSplitsQuery {
         }
         Ok(Self {
             index_uids,
+            node_id: None,
             limit: None,
             offset: None,
             split_states: Vec::new(),
@@ -575,6 +651,12 @@ impl ListSplitsQuery {
             mature: Bound::Unbounded,
             sort_by_staleness: false,
         })
+    }
+
+    /// Selects splits produced by the specified node.
+    pub fn with_node_id(mut self, node_id: NodeId) -> Self {
+        self.node_id = Some(node_id);
+        self
     }
 
     /// Sets the maximum number of splits to retrieve.
@@ -589,130 +671,130 @@ impl ListSplitsQuery {
         self
     }
 
-    /// Select splits which have the given split state.
+    /// Selects splits which have the given split state.
     pub fn with_split_state(mut self, state: SplitState) -> Self {
         self.split_states.push(state);
         self
     }
 
-    /// Select splits which have the any of the following split state.
+    /// Selects splits which have the any of the following split state.
     pub fn with_split_states(mut self, states: impl AsRef<[SplitState]>) -> Self {
         self.split_states.extend_from_slice(states.as_ref());
         self
     }
 
-    /// Select splits which match the given tag filter.
+    /// Selects splits which match the given tag filter.
     pub fn with_tags_filter(mut self, tags: TagFilterAst) -> Self {
         self.tags = Some(tags);
         self
     }
 
-    /// Set the field's lower bound to match values that are
+    /// Sets the field's lower bound to match values that are
     /// *less than or equal to* the provided value.
     pub fn with_time_range_end_lte(mut self, v: i64) -> Self {
         self.time_range.end = Bound::Included(v);
         self
     }
 
-    /// Set the field's lower bound to match values that are
+    /// Sets the field's lower bound to match values that are
     /// *less than* the provided value.
     pub fn with_time_range_end_lt(mut self, v: i64) -> Self {
         self.time_range.end = Bound::Excluded(v);
         self
     }
 
-    /// Set the field's upper bound to match values that are
+    /// Sets the field's upper bound to match values that are
     /// *greater than or equal to* the provided value.
     pub fn with_time_range_start_gte(mut self, v: i64) -> Self {
         self.time_range.start = Bound::Included(v);
         self
     }
 
-    /// Set the field's upper bound to match values that are
+    /// Sets the field's upper bound to match values that are
     /// *greater than* the provided value.
     pub fn with_time_range_start_gt(mut self, v: i64) -> Self {
         self.time_range.start = Bound::Excluded(v);
         self
     }
 
-    /// Set the field's lower bound to match values that are
+    /// Sets the field's lower bound to match values that are
     /// *less than or equal to* the provided value.
     pub fn with_delete_opstamp_lte(mut self, v: u64) -> Self {
         self.delete_opstamp.end = Bound::Included(v);
         self
     }
 
-    /// Set the field's lower bound to match values that are
+    /// Sets the field's lower bound to match values that are
     /// *less than* the provided value.
     pub fn with_delete_opstamp_lt(mut self, v: u64) -> Self {
         self.delete_opstamp.end = Bound::Excluded(v);
         self
     }
 
-    /// Set the field's upper bound to match values that are
+    /// Sets the field's upper bound to match values that are
     /// *greater than or equal to* the provided value.
     pub fn with_delete_opstamp_gte(mut self, v: u64) -> Self {
         self.delete_opstamp.start = Bound::Included(v);
         self
     }
 
-    /// Set the field's upper bound to match values that are
+    /// Sets the field's upper bound to match values that are
     /// *greater than* the provided value.
     pub fn with_delete_opstamp_gt(mut self, v: u64) -> Self {
         self.delete_opstamp.start = Bound::Excluded(v);
         self
     }
 
-    /// Set the field's lower bound to match values that are
+    /// Sets the field's lower bound to match values that are
     /// *less than or equal to* the provided value.
     pub fn with_update_timestamp_lte(mut self, v: i64) -> Self {
         self.update_timestamp.end = Bound::Included(v);
         self
     }
 
-    /// Set the field's lower bound to match values that are
+    /// Sets the field's lower bound to match values that are
     /// *less than* the provided value.
     pub fn with_update_timestamp_lt(mut self, v: i64) -> Self {
         self.update_timestamp.end = Bound::Excluded(v);
         self
     }
 
-    /// Set the field's upper bound to match values that are
+    /// Sets the field's upper bound to match values that are
     /// *greater than or equal to* the provided value.
     pub fn with_update_timestamp_gte(mut self, v: i64) -> Self {
         self.update_timestamp.start = Bound::Included(v);
         self
     }
 
-    /// Set the field's upper bound to match values that are
+    /// Sets the field's upper bound to match values that are
     /// *greater than* the provided value.
     pub fn with_update_timestamp_gt(mut self, v: i64) -> Self {
         self.update_timestamp.start = Bound::Excluded(v);
         self
     }
 
-    /// Set the field's lower bound to match values that are
+    /// Sets the field's lower bound to match values that are
     /// *less than or equal to* the provided value.
     pub fn with_create_timestamp_lte(mut self, v: i64) -> Self {
         self.create_timestamp.end = Bound::Included(v);
         self
     }
 
-    /// Set the field's lower bound to match values that are
+    /// Sets the field's lower bound to match values that are
     /// *less than* the provided value.
     pub fn with_create_timestamp_lt(mut self, v: i64) -> Self {
         self.create_timestamp.end = Bound::Excluded(v);
         self
     }
 
-    /// Set the field's upper bound to match values that are
+    /// Sets the field's upper bound to match values that are
     /// *greater than or equal to* the provided value.
     pub fn with_create_timestamp_gte(mut self, v: i64) -> Self {
         self.create_timestamp.start = Bound::Included(v);
         self
     }
 
-    /// Set the field's upper bound to match values that are
+    /// Sets the field's upper bound to match values that are
     /// *greater than* the provided value.
     pub fn with_create_timestamp_gt(mut self, v: i64) -> Self {
         self.create_timestamp.start = Bound::Excluded(v);

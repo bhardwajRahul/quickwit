@@ -30,14 +30,21 @@ use quickwit_proto::ingest::{Shard, ShardState};
 use quickwit_proto::types::{IndexUid, NodeId, ShardId, SourceId, SourceUid};
 use tracing::{error, info, warn};
 
-/// Limits the number of shards that can be opened for scaling up a source to 5 per minute.
+/// Limits the number of shards that can be opened for scaling up a source to 12 per minute.
 const SCALING_UP_RATE_LIMITER_SETTINGS: RateLimiterSettings = RateLimiterSettings {
-    burst_limit: 5,
+    burst_limit: 12,
     rate_limit: ConstantRate::new(5, Duration::from_secs(60)),
-    refill_period: Duration::from_secs(12),
+    refill_period: Duration::from_secs(5),
 };
 
-/// Limits the number of shards that can be closed for scaling down a source to 1 per minute.
+/// Limits the number of shards that can be closed for scaling down a source to 2 per minute.
+#[cfg(not(test))]
+const SCALING_DOWN_RATE_LIMITER_SETTINGS: RateLimiterSettings = RateLimiterSettings {
+    burst_limit: 2,
+    rate_limit: ConstantRate::new(2, Duration::from_secs(60)),
+    refill_period: Duration::from_secs(30),
+};
+#[cfg(test)]
 const SCALING_DOWN_RATE_LIMITER_SETTINGS: RateLimiterSettings = RateLimiterSettings {
     burst_limit: 1,
     rate_limit: ConstantRate::new(1, Duration::from_secs(60)),
@@ -323,25 +330,6 @@ impl ShardTable {
             .map(|(source, shard_table)| (source, shard_table.shard_entries.values()))
     }
 
-    pub(crate) fn set_shards_as_unavailable(&mut self, unavailable_leaders: &FnvHashSet<NodeId>) {
-        for (source_uid, shard_table_entry) in &mut self.table_entries {
-            let mut modified = false;
-            for shard_entry in shard_table_entry.shard_entries.values_mut() {
-                if shard_entry.is_open() && unavailable_leaders.contains(&shard_entry.leader_id) {
-                    shard_entry.set_shard_state(ShardState::Unavailable);
-                    modified = true;
-                }
-            }
-            if modified {
-                let num_open_shards = shard_table_entry.num_open_shards();
-                crate::metrics::CONTROL_PLANE_METRICS
-                    .open_shards_total
-                    .with_label_values([source_uid.index_uid.index_id.as_str()])
-                    .set(num_open_shards as i64);
-            };
-        }
-    }
-
     /// Lists the shards of a given source. Returns `None` if the source does not exist.
     pub fn get_shards(&self, source_uid: &SourceUid) -> Option<&FnvHashMap<ShardId, ShardEntry>> {
         self.table_entries
@@ -454,9 +442,11 @@ impl ShardTable {
             } else {
                 0
             };
+        let index_label =
+            quickwit_common::metrics::index_label(source_uid.index_uid.index_id.as_str());
         crate::metrics::CONTROL_PLANE_METRICS
             .open_shards_total
-            .with_label_values([source_uid.index_uid.index_id.as_str()])
+            .with_label_values([index_label])
             .set(num_open_shards as i64);
     }
 

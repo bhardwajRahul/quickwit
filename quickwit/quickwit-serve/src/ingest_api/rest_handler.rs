@@ -18,7 +18,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use bytes::{Buf, Bytes};
-use quickwit_config::{IngestApiConfig, INGEST_V2_SOURCE_ID};
+use quickwit_config::{disable_ingest_v1, IngestApiConfig, INGEST_V2_SOURCE_ID};
 use quickwit_ingest::{
     CommitType, DocBatchBuilder, DocBatchV2Builder, FetchResponse, IngestRequest, IngestResponse,
     IngestService, IngestServiceClient, IngestServiceError, TailRequest,
@@ -27,9 +27,8 @@ use quickwit_proto::ingest::router::{
     IngestFailureReason, IngestRequestV2, IngestResponseV2, IngestRouterService,
     IngestRouterServiceClient, IngestSubrequest,
 };
-use quickwit_proto::types::IndexId;
+use quickwit_proto::types::{DocUidGenerator, IndexId};
 use serde::Deserialize;
-use thiserror::Error;
 use warp::{Filter, Rejection};
 
 use crate::decompression::get_body_bytes;
@@ -49,12 +48,6 @@ pub struct IngestApi;
     quickwit_ingest::CommitType,
 )))]
 pub struct IngestApiSchemas;
-
-#[derive(Debug, Error)]
-#[error("request body contains invalid UTF-8 characters")]
-struct InvalidUtf8;
-
-impl warp::reject::Reject for InvalidUtf8 {}
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 struct IngestOptions {
@@ -126,12 +119,13 @@ async fn ingest_v2(
     index_id: IndexId,
     body: Body,
     ingest_options: IngestOptions,
-    mut ingest_router: IngestRouterServiceClient,
+    ingest_router: IngestRouterServiceClient,
 ) -> Result<IngestResponse, IngestServiceError> {
     let mut doc_batch_builder = DocBatchV2Builder::default();
+    let mut doc_uid_generator = DocUidGenerator::default();
 
     for doc in lines(&body.content) {
-        doc_batch_builder.add_doc(doc);
+        doc_batch_builder.add_doc(doc_uid_generator.next_doc_uid(), doc);
     }
     let doc_batch_opt = doc_batch_builder.build();
 
@@ -184,7 +178,9 @@ fn convert_ingest_response_v2(
             ingest_failure.index_id
         )),
         IngestFailureReason::Internal => IngestServiceError::Internal("internal error".to_string()),
-        IngestFailureReason::NoShardsAvailable => IngestServiceError::Unavailable,
+        IngestFailureReason::NoShardsAvailable => {
+            IngestServiceError::Unavailable("no shards available".to_string())
+        }
         IngestFailureReason::RateLimited => IngestServiceError::RateLimited,
         IngestFailureReason::ResourceExhausted => IngestServiceError::RateLimited,
         IngestFailureReason::Timeout => {
@@ -208,11 +204,15 @@ fn convert_ingest_response_v2(
 )]
 /// Ingest documents
 async fn ingest(
-    index_id: String,
+    index_id: IndexId,
     body: Body,
     ingest_options: IngestOptions,
-    mut ingest_service: IngestServiceClient,
+    ingest_service: IngestServiceClient,
 ) -> Result<IngestResponse, IngestServiceError> {
+    if disable_ingest_v1() {
+        let message = "ingest v1 is disabled: environment variable `QW_DISABLE_INGEST_V1` is set";
+        return Err(IngestServiceError::Internal(message.to_string()));
+    }
     // The size of the body should be an upper bound of the size of the batch. The removal of the
     // end of line character for each doc compensates the addition of the `DocCommand` header.
     let mut doc_batch_builder = DocBatchBuilder::with_capacity(index_id, body.content.remaining());
@@ -254,8 +254,8 @@ fn tail_filter() -> impl Filter<Extract = (String,), Error = Rejection> + Clone 
 )]
 /// Returns the last few ingested documents.
 async fn tail_endpoint(
-    index_id: String,
-    mut ingest_service: IngestServiceClient,
+    index_id: IndexId,
+    ingest_service: IngestServiceClient,
 ) -> Result<FetchResponse, IngestServiceError> {
     let fetch_response = ingest_service.tail(TailRequest { index_id }).await?;
     Ok(fetch_response)

@@ -17,11 +17,9 @@ provider "aws" {
   }
 }
 
-# resource "aws_ecr_repository" "quickwit" {
-#   name                 = "quickwit"
-#   force_delete         = true
-#   image_tag_mutability = "MUTABLE"
-# }
+data "aws_region" "current" {}
+
+data "aws_caller_identity" "current" {}
 
 module "quickwit" {
   source                       = "../quickwit"
@@ -31,9 +29,12 @@ module "quickwit" {
 
   ## Optional configurations:
 
+  # - ECR if you provide the `dockerhub_pull_through_creds_secret_arn` variable
+  # - Docker Hub otherwise (subject to throttling)
+  quickwit_image = "${local.quickwit_image}:latest"
+
   # quickwit_index_s3_prefix  = "my-bucket/my-prefix"
   # quickwit_domain           = "quickwit"
-  # quickwit_image = aws_ecr_repository.quickwit.repository_url
   # quickwit_cpu_architecture = "ARM64"
 
   # quickwit_indexer = {
@@ -71,7 +72,7 @@ module "quickwit" {
   #   multi_az       = false
   # }
 
-  # external_postgres_uri_ssm_parameter_arn = aws_ssm_parameter.postgres_uri.arn
+  # external_postgres_uri_secret_arn = aws_ssm_parameter.postgres_uri.arn
 
   ## Example logging configuration 
   # sidecar_container_definitions  = {

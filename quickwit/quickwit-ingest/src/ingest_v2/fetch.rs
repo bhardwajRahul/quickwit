@@ -171,7 +171,7 @@ impl FetchStreamTask {
                 };
                 let batch_size = mrecord_batch.estimate_size();
                 let fetch_payload = FetchPayload {
-                    index_uid: self.index_uid.clone().into(),
+                    index_uid: Some(self.index_uid.clone()),
                     source_id: self.source_id.clone(),
                     shard_id: Some(self.shard_id.clone()),
                     mrecord_batch: Some(mrecord_batch),
@@ -209,7 +209,7 @@ impl FetchStreamTask {
                     let eof_position = to_position_inclusive.as_eof();
 
                     let fetch_eof = FetchEof {
-                        index_uid: self.index_uid.clone().into(),
+                        index_uid: Some(self.index_uid.clone()),
                         source_id: self.source_id.clone(),
                         shard_id: Some(self.shard_id.clone()),
                         eof_position: Some(eof_position),
@@ -457,7 +457,7 @@ async fn fault_tolerant_fetch_stream(
     'outer: for (ingester_idx, ingester_id) in ingester_ids.iter().enumerate() {
         let failover_ingester_id_opt = ingester_ids.get(ingester_idx + 1);
 
-        let Some(mut ingester) = ingester_pool.get(ingester_id) else {
+        let Some(ingester) = ingester_pool.get(ingester_id) else {
             if let Some(failover_ingester_id) = failover_ingester_id_opt {
                 warn!(
                     client_id=%client_id,
@@ -553,7 +553,7 @@ async fn fault_tolerant_fetch_stream(
                 Ok(fetch_message) => match &fetch_message.message {
                     Some(fetch_message::Message::Payload(fetch_payload)) => {
                         let batch_size = fetch_payload.estimate_size();
-                        let to_position_inclusive = fetch_payload.to_position_inclusive().clone();
+                        let to_position_inclusive = fetch_payload.to_position_inclusive();
                         let in_flight_value = InFlightValue::new(
                             fetch_message,
                             batch_size,
@@ -566,7 +566,7 @@ async fn fault_tolerant_fetch_stream(
                         *from_position_exclusive = to_position_inclusive;
                     }
                     Some(fetch_message::Message::Eof(fetch_eof)) => {
-                        let eof_position = fetch_eof.eof_position().clone();
+                        let eof_position = fetch_eof.eof_position();
                         let in_flight_value = InFlightValue::new(
                             fetch_message,
                             ByteSize(0),

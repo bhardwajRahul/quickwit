@@ -23,6 +23,7 @@ use std::collections::{btree_set, BTreeSet, HashMap};
 use async_trait::async_trait;
 use prost::Message;
 use quickwit_common::rate_limited_error;
+use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_common::uri::Uri;
 use quickwit_config::{load_index_config_from_user_config, ConfigFormat, IndexConfig};
 use quickwit_ingest::{
@@ -262,7 +263,7 @@ impl OtlpGrpcLogsService {
             num_log_records,
             num_parse_errors,
             error_message,
-        } = tokio::task::spawn_blocking({
+        } = run_cpu_intensive({
             let parent_span = RuntimeSpan::current();
             || Self::parse_logs(request, parent_span, index_id)
         })
@@ -569,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_index() {
-        let mut metastore = metastore_for_test();
+        let metastore = metastore_for_test();
         let index_config =
             OtlpGrpcLogsService::index_config(&Uri::for_test("ram:///indexes")).unwrap();
         let create_index_request =

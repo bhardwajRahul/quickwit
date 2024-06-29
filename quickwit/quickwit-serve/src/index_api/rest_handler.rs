@@ -22,9 +22,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use quickwit_common::uri::Uri;
 use quickwit_config::{
-    load_source_config_from_user_config, validate_index_id_pattern, ConfigFormat, NodeConfig,
-    RetentionPolicy, SearchSettings, SourceConfig, SourceParams, CLI_SOURCE_ID,
-    INGEST_API_SOURCE_ID,
+    load_index_config_update, load_source_config_from_user_config, validate_index_id_pattern,
+    ConfigFormat, NodeConfig, SourceConfig, SourceParams, CLI_SOURCE_ID, INGEST_API_SOURCE_ID,
 };
 use quickwit_doc_mapper::{analyze_text, TokenizerConfig};
 use quickwit_index_management::{IndexService, IndexServiceError};
@@ -39,7 +38,7 @@ use quickwit_proto::metastore::{
     MetastoreService, MetastoreServiceClient, ResetSourceCheckpointRequest, ToggleSourceRequest,
     UpdateIndexRequest,
 };
-use quickwit_proto::types::IndexUid;
+use quickwit_proto::types::{IndexId, IndexUid, SourceId};
 use quickwit_query::query_ast::{query_ast_from_user_text, QueryAst};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -47,6 +46,7 @@ use tracing::{info, warn};
 use warp::{Filter, Rejection};
 
 use crate::format::{extract_config_format, extract_format_from_qs};
+use crate::rest::recover_fn;
 use crate::rest_api_response::into_rest_api_response;
 use crate::simple_list::{from_simple_list, to_simple_list};
 use crate::with_arg;
@@ -67,7 +67,7 @@ use crate::with_arg;
         toggle_source,
         delete_source,
     ),
-    components(schemas(ToggleSource, SplitsForDeletion, IndexStats, IndexUpdates))
+    components(schemas(ToggleSource, SplitsForDeletion, IndexStats))
 )]
 pub struct IndexApi;
 
@@ -107,6 +107,7 @@ pub fn index_management_handlers(
         .or(analyze_request_handler())
         // Parse query into query AST handler.
         .or(parse_query_request_handler())
+        .recover(recover_fn)
 }
 
 fn json_body<T: DeserializeOwned + Send>(
@@ -114,7 +115,7 @@ fn json_body<T: DeserializeOwned + Send>(
     warp::body::content_length_limit(1024 * 1024).and(warp::body::json())
 }
 
-fn get_index_metadata_handler(
+pub fn get_index_metadata_handler(
     metastore: MetastoreServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     warp::path!("indexes" / String)
@@ -126,8 +127,8 @@ fn get_index_metadata_handler(
 }
 
 async fn get_index_metadata(
-    index_id: String,
-    mut metastore: MetastoreServiceClient,
+    index_id: IndexId,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<IndexMetadata> {
     info!(index_id = %index_id, "get-index-metadata");
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
@@ -164,7 +165,8 @@ fn list_indexes_metadata_handler(
 /// Describes an index with its main information and statistics.
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 struct IndexStats {
-    pub index_id: String,
+    #[schema(value_type = String)]
+    pub index_id: IndexId,
     #[schema(value_type = String)]
     pub index_uri: Uri,
     pub num_published_splits: usize,
@@ -190,8 +192,8 @@ struct IndexStats {
 
 /// Describes an index.
 async fn describe_index(
-    index_id: String,
-    mut metastore: MetastoreServiceClient,
+    index_id: IndexId,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<IndexStats> {
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
     let index_metadata = metastore
@@ -317,9 +319,9 @@ pub struct ListSplitsResponse {
 
 /// Get splits.
 async fn list_splits(
-    index_id: String,
+    index_id: IndexId,
     list_split_query: ListSplitsQueryParams,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<ListSplitsResponse> {
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
     let index_uid: IndexUid = metastore
@@ -394,9 +396,9 @@ struct SplitsForDeletion {
 )]
 /// Marks splits for deletion.
 async fn mark_splits_for_deletion(
-    index_id: String,
+    index_id: IndexId,
     splits_for_deletion: SplitsForDeletion,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<()> {
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
     let index_uid: IndexUid = metastore
@@ -446,7 +448,7 @@ fn mark_splits_for_deletion_handler(
 /// Gets indexes metadata.
 async fn list_indexes_metadata(
     list_indexes_params: ListIndexesQueryParams,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<Vec<IndexMetadata>> {
     let list_indexes_metata_request =
         if let Some(index_id_patterns) = list_indexes_params.index_id_patterns {
@@ -526,22 +528,14 @@ async fn create_index(
         .await
 }
 
-/// The body of the index update request. All fields will be replaced in the
-/// existing configuration.
-#[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Default, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)] // Remove when adding new fields to allow to ensure forward compatibility
-pub struct IndexUpdates {
-    pub search_settings: SearchSettings,
-    #[serde(rename = "retention_policy")]
-    pub retention_policy_opt: Option<RetentionPolicy>,
-}
-
 fn update_index_handler(
     metastore: MetastoreServiceClient,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     warp::path!("indexes" / String)
         .and(warp::put())
-        .and(json_body())
+        .and(extract_config_format())
+        .and(warp::body::content_length_limit(1024 * 1024))
+        .and(warp::filters::body::bytes())
         .and(with_arg(metastore))
         .then(update_index)
         .map(log_failure("failed to update index"))
@@ -553,9 +547,9 @@ fn update_index_handler(
     put,
     tag = "Indexes",
     path = "/indexes/{index_id}",
-    request_body = IndexUpdates,
+    request_body = VersionedIndexConfig,
     responses(
-        (status = 200, description = "Successfully updated the index configuration.")
+        (status = 200, description = "Successfully updated the index configuration.", body = VersionedIndexMetadata)
     ),
     params(
         ("index_id" = String, Path, description = "The index ID to update."),
@@ -563,26 +557,37 @@ fn update_index_handler(
 )]
 /// Updates an existing index.
 ///
-/// This endpoint has PUT semantics, which means that all the updatable fields of the index
-/// configuration are replaced by the values specified in the request. In particular, omitting an
-/// optional field like `retention_policy` will delete the associated configuration.
+/// This endpoint follows PUT semantics, which means that all the fields of the
+/// current configuration are replaced by the values specified in this request
+/// or the associated defaults. In particular, if the field is optional (e.g.
+/// `retention_policy`), omitting it will delete the associated configuration.
+/// If the new configuration file contains updates that cannot be applied, the
+/// request fails, and none of the updates are applied.
 async fn update_index(
-    index_id: String,
-    request: IndexUpdates,
-    mut metastore: MetastoreServiceClient,
+    target_index_id: IndexId,
+    config_format: ConfigFormat,
+    index_config_bytes: Bytes,
+    metastore: MetastoreServiceClient,
 ) -> Result<IndexMetadata, IndexServiceError> {
-    info!(index_id = %index_id, "update-index");
-    let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
-    let index_uid: IndexUid = metastore
+    info!(index_id = %target_index_id, "update-index");
+
+    let index_metadata_request = IndexMetadataRequest::for_index_id(target_index_id.to_string());
+    let current_index_metadata = metastore
         .index_metadata(index_metadata_request)
         .await?
-        .deserialize_index_metadata()?
-        .index_uid;
+        .deserialize_index_metadata()?;
+    let index_uid = current_index_metadata.index_uid.clone();
+    let current_index_config = current_index_metadata.into_index_config();
+
+    let new_index_config =
+        load_index_config_update(config_format, &index_config_bytes, &current_index_config)
+            .map_err(IndexServiceError::InvalidConfig)?;
 
     let update_request = UpdateIndexRequest::try_from_updates(
         index_uid,
-        &request.search_settings,
-        &request.retention_policy_opt,
+        &new_index_config.search_settings,
+        &new_index_config.retention_policy_opt,
+        &new_index_config.indexing_settings,
     )?;
     let update_resp = metastore.update_index(update_request).await?;
     Ok(update_resp.deserialize_index_metadata()?)
@@ -613,7 +618,7 @@ fn clear_index_handler(
 /// Removes all of the data (splits, queued document) associated with the index, but keeps the index
 /// configuration. (See also, `delete-index`).
 async fn clear_index(
-    index_id: String,
+    index_id: IndexId,
     mut index_service: IndexService,
 ) -> Result<(), IndexServiceError> {
     info!(index_id = %index_id, "clear-index");
@@ -654,7 +659,7 @@ fn delete_index_handler(
 )]
 /// Deletes index.
 async fn delete_index(
-    index_id: String,
+    index_id: IndexId,
     delete_index_query_param: DeleteIndexQueryParam,
     mut index_service: IndexService,
 ) -> Result<Vec<SplitInfo>, IndexServiceError> {
@@ -694,7 +699,7 @@ fn create_source_handler(
 )]
 /// Creates Source.
 async fn create_source(
-    index_id: String,
+    index_id: IndexId,
     config_format: ConfigFormat,
     source_config_bytes: Bytes,
     mut index_service: IndexService,
@@ -732,9 +737,9 @@ fn get_source_handler(
 }
 
 async fn get_source(
-    index_id: String,
-    source_id: String,
-    mut metastore: MetastoreServiceClient,
+    index_id: IndexId,
+    source_id: SourceId,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<SourceConfig> {
     info!(index_id = %index_id, source_id = %source_id, "get-source");
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
@@ -778,9 +783,9 @@ fn reset_source_checkpoint_handler(
 )]
 /// Resets source checkpoint.
 async fn reset_source_checkpoint(
-    index_id: String,
-    source_id: String,
-    mut metastore: MetastoreServiceClient,
+    index_id: IndexId,
+    source_id: SourceId,
+    metastore: MetastoreServiceClient,
 ) -> MetastoreResult<()> {
     let index_metadata_resquest = IndexMetadataRequest::for_index_id(index_id.to_string());
     let index_uid: IndexUid = metastore
@@ -832,10 +837,10 @@ struct ToggleSource {
 )]
 /// Toggles source.
 async fn toggle_source(
-    index_id: String,
-    source_id: String,
+    index_id: IndexId,
+    source_id: SourceId,
     toggle_source: ToggleSource,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
 ) -> Result<(), IndexServiceError> {
     info!(index_id = %index_id, source_id = %source_id, enable = toggle_source.enable, "toggle-source");
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
@@ -884,9 +889,9 @@ fn delete_source_handler(
 )]
 /// Deletes source.
 async fn delete_source(
-    index_id: String,
-    source_id: String,
-    mut metastore: MetastoreServiceClient,
+    index_id: IndexId,
+    source_id: SourceId,
+    metastore: MetastoreServiceClient,
 ) -> Result<(), IndexServiceError> {
     info!(index_id = %index_id, source_id = %source_id, "delete-source");
     let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
@@ -1514,7 +1519,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_delete_index_and_source() {
-        let mut metastore = metastore_for_test();
+        let metastore = metastore_for_test();
         let index_service = IndexService::new(metastore.clone(), StorageResolver::unconfigured());
         let mut node_config = NodeConfig::for_test();
         node_config.default_index_root_uri = Uri::for_test("file:///default-index-root-uri");
@@ -1780,7 +1785,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_index() {
-        let mut metastore = metastore_for_test();
+        let metastore = metastore_for_test();
         let index_service = IndexService::new(metastore.clone(), StorageResolver::unconfigured());
         let mut node_config = NodeConfig::for_test();
         node_config.default_index_root_uri = Uri::for_test("file:///default-index-root-uri");
@@ -1810,7 +1815,7 @@ mod tests {
                 .path("/indexes/hdfs-logs")
                 .method("PUT")
                 .json(&true)
-                .body(r#"{"search_settings":{"default_search_fields":["severity_text","body"]}}"#)
+                .body(r#"{"version": "0.7", "index_id": "hdfs-logs", "doc_mapping": {"field_mappings":[{"name": "timestamp", "type": "i64", "fast": true, "indexed": true}]},"search_settings":{"default_search_fields":["severity_text", "body"]}}"#)
                 .reply(&index_management_handler)
                 .await;
             assert_eq!(resp.status(), 200);

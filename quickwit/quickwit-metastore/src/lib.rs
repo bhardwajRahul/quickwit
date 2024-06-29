@@ -49,8 +49,8 @@ pub(crate) use metastore::index_metadata::serialize::{IndexMetadataV0_8, Version
 pub use metastore::postgres::PostgresqlMetastore;
 pub use metastore::{
     file_backed, AddSourceRequestExt, CreateIndexRequestExt, CreateIndexResponseExt, IndexMetadata,
-    IndexMetadataResponseExt, ListIndexesMetadataResponseExt, ListSplitsQuery,
-    ListSplitsRequestExt, ListSplitsResponseExt, MetastoreServiceExt,
+    IndexMetadataResponseExt, IndexesMetadataResponseExt, ListIndexesMetadataResponseExt,
+    ListSplitsQuery, ListSplitsRequestExt, ListSplitsResponseExt, MetastoreServiceExt,
     MetastoreServiceStreamSplitsExt, PublishSplitsRequestExt, StageSplitsRequestExt,
     UpdateIndexRequestExt,
 };
@@ -63,12 +63,12 @@ pub(crate) use split_metadata_version::{SplitMetadataV0_8, VersionedSplitMetadat
 
 #[derive(utoipa::OpenApi)]
 #[openapi(components(schemas(
+    IndexMetadataV0_8,
     Split,
+    SplitMetadataV0_8,
     SplitState,
     VersionedIndexMetadata,
-    IndexMetadataV0_8,
     VersionedSplitMetadata,
-    SplitMetadataV0_8,
 )))]
 /// Schema used for the OpenAPI generation which are apart of this crate.
 pub struct MetastoreApiSchemas;

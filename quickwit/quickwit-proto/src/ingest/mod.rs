@@ -17,6 +17,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use std::iter::zip;
+
 use bytes::Bytes;
 use bytesize::ByteSize;
 use quickwit_common::tower::MakeLoadShedError;
@@ -25,7 +27,7 @@ use self::ingester::{PersistFailureReason, ReplicateFailureReason};
 use self::router::IngestFailureReason;
 use super::types::NodeId;
 use super::GrpcServiceError;
-use crate::types::{queue_id, IndexUid, Position, QueueId, ShardId};
+use crate::types::{queue_id, DocUid, Position, QueueId, ShardId, SourceUid};
 use crate::{ServiceError, ServiceErrorCode};
 
 pub mod ingester;
@@ -100,6 +102,13 @@ impl Shard {
             .flatten()
             .map(|node_id| NodeId::new(node_id.clone()))
     }
+
+    pub fn source_uid(&self) -> SourceUid {
+        SourceUid {
+            index_uid: self.index_uid().clone(),
+            source_id: self.source_id.clone(),
+        }
+    }
 }
 
 impl ShardPKey {
@@ -109,19 +118,24 @@ impl ShardPKey {
 }
 
 impl DocBatchV2 {
-    pub fn docs(self) -> impl Iterator<Item = Bytes> {
-        let DocBatchV2 {
-            doc_buffer,
-            doc_lengths,
-        } = self;
-        doc_lengths
-            .into_iter()
-            .scan(0, move |start_offset, doc_length| {
-                let start = *start_offset;
-                let end = start + doc_length as usize;
-                *start_offset = end;
-                Some(doc_buffer.slice(start..end))
-            })
+    pub fn docs(&self) -> impl Iterator<Item = (DocUid, Bytes)> + '_ {
+        zip(&self.doc_uids, &self.doc_lengths).scan(
+            self.doc_buffer.clone(),
+            |doc_buffer, (doc_uid, doc_len)| {
+                let doc = doc_buffer.split_to(*doc_len as usize);
+                Some((*doc_uid, doc))
+            },
+        )
+    }
+
+    pub fn into_docs(self) -> impl Iterator<Item = (DocUid, Bytes)> {
+        zip(self.doc_uids, self.doc_lengths).scan(
+            self.doc_buffer,
+            |doc_buffer, (doc_uid, doc_len)| {
+                let doc = doc_buffer.split_to(doc_len as usize);
+                Some((doc_uid, doc))
+            },
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -138,16 +152,19 @@ impl DocBatchV2 {
 
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test(docs: impl IntoIterator<Item = &'static str>) -> Self {
+        let mut doc_uids = Vec::new();
         let mut doc_buffer = Vec::new();
         let mut doc_lengths = Vec::new();
 
-        for doc in docs {
+        for (doc_uid, doc) in docs.into_iter().enumerate() {
+            doc_uids.push(DocUid::for_test(doc_uid as u128));
             doc_buffer.extend(doc.as_bytes());
             doc_lengths.push(doc.len() as u32);
         }
         Self {
-            doc_lengths,
+            doc_uids,
             doc_buffer: Bytes::from(doc_buffer),
+            doc_lengths,
         }
     }
 }
@@ -193,12 +210,6 @@ impl MRecordBatch {
 }
 
 impl Shard {
-    pub fn shard_id(&self) -> &ShardId {
-        self.shard_id
-            .as_ref()
-            .expect("`shard_id` should be a required field")
-    }
-
     pub fn is_open(&self) -> bool {
         self.shard_state().is_open()
     }
@@ -213,12 +224,6 @@ impl Shard {
 
     pub fn queue_id(&self) -> super::types::QueueId {
         queue_id(self.index_uid(), &self.source_id, self.shard_id())
-    }
-
-    pub fn publish_position_inclusive(&self) -> &Position {
-        self.publish_position_inclusive
-            .as_ref()
-            .expect("`publish_position_inclusive` should be a required field")
     }
 }
 
@@ -272,31 +277,11 @@ impl ShardIds {
 }
 
 impl ShardIdPositions {
-    pub fn index_uid(&self) -> &IndexUid {
-        self.index_uid
-            .as_ref()
-            .expect("`index_uid` should be a required field")
-    }
-
-    pub fn queue_id_positions(&self) -> impl Iterator<Item = (QueueId, &Position)> + '_ {
+    pub fn queue_id_positions(&self) -> impl Iterator<Item = (QueueId, Position)> + '_ {
         self.shard_positions.iter().map(|shard_position| {
             let queue_id = queue_id(self.index_uid(), &self.source_id, shard_position.shard_id());
             (queue_id, shard_position.publish_position_inclusive())
         })
-    }
-}
-
-impl ShardIdPosition {
-    pub fn shard_id(&self) -> &ShardId {
-        self.shard_id
-            .as_ref()
-            .expect("`shard_id` should be a required field")
-    }
-
-    pub fn publish_position_inclusive(&self) -> &Position {
-        self.publish_position_inclusive
-            .as_ref()
-            .expect("`publish_position_inclusive` should be a required field")
     }
 }
 

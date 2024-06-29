@@ -53,9 +53,9 @@ use quickwit_metastore::{
     ListSplitsQuery, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitMetadata,
     SplitState,
 };
-use quickwit_proto::indexing::IndexingPipelineId;
+use quickwit_proto::indexing::MergePipelineId;
 use quickwit_proto::metastore::{ListSplitsRequest, MetastoreService};
-use quickwit_proto::types::{IndexUid, PipelineUid};
+use quickwit_proto::types::{IndexUid, NodeId};
 use serde_json::Value as JsonValue;
 use tantivy::Directory;
 
@@ -268,7 +268,7 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
     }
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let mut metastore = test_index_builder.metastore();
+    let metastore = test_index_builder.metastore();
     let split_metadatas: Vec<SplitMetadata> = metastore
         .list_splits(ListSplitsRequest::try_from_index_uid(test_index_builder.index_uid()).unwrap())
         .await?
@@ -298,11 +298,10 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
         downloaded_splits_directory,
         tantivy_dirs,
     };
-    let pipeline_id = IndexingPipelineId {
+    let pipeline_id = MergePipelineId {
+        node_id: NodeId::from("test-node"),
         index_uid: IndexUid::new_with_random_ulid(index_id),
         source_id: "test-source".to_string(),
-        node_id: "test-node".to_string(),
-        pipeline_uid: PipelineUid::default(),
     };
 
     let universe = test_index_builder.universe();

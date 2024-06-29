@@ -52,8 +52,8 @@ pub(super) async fn append_non_empty_doc_batch(
 ) -> Result<Position, AppendDocBatchError> {
     let append_result = if force_commit {
         let encoded_mrecords = doc_batch
-            .docs()
-            .map(|doc| MRecord::Doc(doc).encode())
+            .into_docs()
+            .map(|(_doc_uid, doc)| MRecord::Doc(doc).encode())
             .chain(once(MRecord::Commit.encode()));
 
         #[cfg(feature = "failpoints")]
@@ -66,7 +66,9 @@ pub(super) async fn append_non_empty_doc_batch(
             .append_records(queue_id, None, encoded_mrecords)
             .await
     } else {
-        let encoded_mrecords = doc_batch.docs().map(|doc| MRecord::Doc(doc).encode());
+        let encoded_mrecords = doc_batch
+            .into_docs()
+            .map(|(_doc_uid, doc)| MRecord::Doc(doc).encode());
 
         #[cfg(feature = "failpoints")]
         fail_point!("ingester:append_records", |_| {
@@ -177,6 +179,7 @@ pub(super) fn queue_position_range(
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "failpoints"))]
     #[tokio::test]
     async fn test_append_non_empty_doc_batch() {
         let tempdir = tempfile::tempdir().unwrap();

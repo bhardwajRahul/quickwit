@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::Context;
 use colored::Colorize;
 use opentelemetry::global;
 use quickwit_cli::busy_detector;
@@ -29,17 +30,31 @@ use quickwit_cli::cli::{build_cli, CliCommand};
 #[cfg(feature = "jemalloc")]
 use quickwit_cli::jemalloc::start_jemalloc_metrics_loop;
 use quickwit_cli::logger::setup_logging_and_tracing;
+use quickwit_common::runtimes::scrape_tokio_runtime_metrics;
 use quickwit_serve::BuildInfo;
 use tracing::error;
 
+/// The main tokio runtime takes num_cores / 3 threads by default, and can be overridden by the
+/// QW_RUNTIME_NUM_THREADS environment variable.
+fn get_main_runtime_num_threads() -> usize {
+    let default_num_runtime_threads: usize = quickwit_common::num_cpus().div_ceil(3);
+    quickwit_common::get_from_env("QW_TOKIO_RUNTIME_NUM_THREADS", default_num_runtime_threads)
+}
+
 fn main() -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let main_runtime_num_threads: usize = get_main_runtime_num_threads();
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .on_thread_unpark(busy_detector::thread_unpark)
         .on_thread_park(busy_detector::thread_park)
+        .thread_name("main_runtime_thread")
+        .worker_threads(main_runtime_num_threads)
         .build()
-        .unwrap()
-        .block_on(main_impl())
+        .context("failed to start main Tokio runtime")?;
+
+    scrape_tokio_runtime_metrics(rt.handle(), "main");
+
+    rt.block_on(main_impl())
 }
 
 fn register_build_info_metric() {

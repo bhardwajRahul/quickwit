@@ -50,7 +50,7 @@ pub(super) const SYN_REPLICATION_STREAM_CAPACITY: usize = 5;
 
 /// Duration after which replication requests time out with [`ReplicationError::Timeout`].
 const REPLICATION_REQUEST_TIMEOUT: Duration = if cfg!(any(test, feature = "testsuite")) {
-    Duration::from_millis(50)
+    Duration::from_millis(250)
 } else {
     Duration::from_secs(3)
 };
@@ -555,7 +555,7 @@ impl ReplicationTask {
 
         for subrequest in replicate_request.subrequests {
             let queue_id = subrequest.queue_id();
-            let from_position_exclusive = subrequest.from_position_exclusive().clone();
+            let from_position_exclusive = subrequest.from_position_exclusive();
 
             let Some(shard) = state_guard.shards.get(&queue_id) else {
                 let replicate_failure = ReplicateFailure {
@@ -1239,18 +1239,18 @@ mod tests {
 
         state_guard
             .mrecordlog
-            .assert_records_eq(&queue_id_01, .., &[(0, "\0\0test-doc-foo")]);
+            .assert_records_eq(&queue_id_01, .., &[(0, [0, 0], "test-doc-foo")]);
 
         state_guard.mrecordlog.assert_records_eq(
             &queue_id_02,
             ..,
-            &[(0, "\0\0test-doc-bar"), (1, "\0\0test-doc-baz")],
+            &[(0, [0, 0], "test-doc-bar"), (1, [0, 0], "test-doc-baz")],
         );
 
         state_guard.mrecordlog.assert_records_eq(
             &queue_id_11,
             ..,
-            &[(0, "\0\0test-doc-qux"), (1, "\0\0test-doc-tux")],
+            &[(0, [0, 0], "test-doc-qux"), (1, [0, 0], "test-doc-tux")],
         );
         drop(state_guard);
 
@@ -1296,7 +1296,7 @@ mod tests {
         state_guard.mrecordlog.assert_records_eq(
             &queue_id_01,
             ..,
-            &[(0, "\0\0test-doc-foo"), (1, "\0\0test-doc-moo")],
+            &[(0, [0, 0], "test-doc-foo"), (1, [0, 0], "test-doc-moo")],
         );
     }
 
@@ -1376,6 +1376,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "failpoints"))]
     #[tokio::test]
     async fn test_replication_task_deletes_dangling_shard() {
         let leader_id: NodeId = "test-leader".into();

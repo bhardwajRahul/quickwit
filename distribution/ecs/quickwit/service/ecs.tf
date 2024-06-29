@@ -22,17 +22,12 @@ module "quickwit_service" {
 
       command = ["run"]
 
-      environment = concat(local.quickwit_common_environment, [
-        {
-          name  = "QW_ENABLED_SERVICES"
-          value = var.service_name
-        }
-      ])
+      environment = local.quickwit_common_environment
 
       secrets = [
         {
           name      = "QW_METASTORE_URI"
-          valueFrom = var.postgres_credential_arn
+          valueFrom = var.postgres_uri_secret_arn
         }
       ]
 
@@ -122,10 +117,6 @@ module "quickwit_service" {
     {
       name = "quickwit-keys"
     }
-  ]
-
-  task_exec_ssm_param_arns = [
-    var.postgres_credential_arn
   ]
 
   tasks_iam_role_policies = local.tasks_iam_role_policies
